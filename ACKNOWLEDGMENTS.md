@@ -1,9 +1,6 @@
-# Individual Contributors
+Contributions from upstream forked MLX LM. mlx-meow does not keep track of that.
 
-If you wish to be acknowledged for your contributions, please list your name
-with a short description of your contribution(s) below. For example:
-
-- Jane Smith: Added the `foo` example.
+---
 
 MLX LM was developed with contributions from the following individuals:
 
