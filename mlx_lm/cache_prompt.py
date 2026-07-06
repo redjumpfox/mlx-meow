@@ -4,10 +4,11 @@ import argparse
 import json
 import sys
 import time
+from functools import partial
 
 import mlx.core as mx
 
-from .generate import generate_step
+from .generate import generate_step, maybe_quantize_kv_cache
 from .models.cache import make_prompt_cache, save_prompt_cache
 from .utils import load
 
@@ -15,7 +16,6 @@ DEFAULT_QUANTIZED_KV_START = 5000
 
 
 def setup_arg_parser():
-    """Set up and return the argument parser."""
     parser = argparse.ArgumentParser(
         description="Cache the state of a prompt to be reused with mlx_lm.generate"
     )
@@ -77,6 +77,19 @@ def setup_arg_parser():
         type=int,
         default=DEFAULT_QUANTIZED_KV_START,
     )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Also prefill the MTP sidecar cache (for models with an MTP module). "
+        "The saved cache includes both backbone and MTP entries so the sidecar "
+        "does not need to re-process the prompt on each generation call.",
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=512,
+        help="Tokens per prefill chunk when --mtp is active. Default: 512.",
+    )
     return parser
 
 
@@ -84,8 +97,7 @@ def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
 
-    # Building tokenizer_config
-    tokenizer_config = {"trust_remote_code": args.trust_remote_code}
+    tokenizer_config = {"trust_remote_code": True if args.trust_remote_code else None}
     if args.eos_token is not None:
         tokenizer_config["eos_token"] = args.eos_token
 
@@ -112,7 +124,6 @@ def main():
     cache = make_prompt_cache(model, args.max_kv_size)
     y = mx.array(prompt)
 
-    # Process the prompt
     start = time.time()
     max_msg_len = 0
 
@@ -124,17 +135,44 @@ def main():
         max_msg_len = max(max_msg_len, len(msg))
         print(msg + " " * (max_msg_len - len(msg)), end="", flush=True)
 
-    for _ in generate_step(
-        y,
-        model,
-        max_tokens=0,
-        prompt_cache=cache,
-        kv_bits=args.kv_bits,
-        kv_group_size=args.kv_group_size,
-        quantized_kv_start=args.quantized_kv_start,
-        prompt_progress_callback=callback,
-    ):
-        pass
+    mtp_active = args.mtp and hasattr(model, "make_mtp_cache")
+
+    if mtp_active:
+        mtp_cache = model.make_mtp_cache()
+        quantize_fn = partial(
+            maybe_quantize_kv_cache,
+            quantized_kv_start=args.quantized_kv_start,
+            kv_group_size=args.kv_group_size,
+            kv_bits=args.kv_bits,
+        )
+        total = y.size
+        processed = 0
+        callback(processed, total)
+        while total > 1:
+            n = min(args.prefill_step_size, total - 1)
+            _, hidden = model(y[:n][None], cache=cache, return_hidden=True)
+            model.mtp_forward(hidden, y[1 : n + 1][None], mtp_cache)
+            quantize_fn(cache)
+            quantize_fn(mtp_cache)
+            mx.eval([c.state for c in cache + mtp_cache if hasattr(c, "state")])
+            processed += n
+            callback(processed, total)
+            y = y[n:]
+            total -= n
+            mx.clear_cache()
+        cache = cache + mtp_cache
+    else:
+        for _ in generate_step(
+            y,
+            model,
+            max_tokens=0,
+            prompt_cache=cache,
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            quantized_kv_start=args.quantized_kv_start,
+            prompt_progress_callback=callback,
+        ):
+            pass
 
     print()
     print(f"Peak memory: {mx.get_peak_memory() / 1e9:.3f} GB")

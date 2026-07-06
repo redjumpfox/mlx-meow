@@ -1,15 +1,11 @@
 import argparse
+import sys
 from typing import List, Union
 
 from huggingface_hub import scan_cache_dir
 
 
 def tabulate(rows: List[List[Union[str, int]]], headers: List[str]) -> str:
-    """
-    Inspired by:
-    - stackoverflow.com/a/8356620/593036
-    - stackoverflow.com/questions/9535954/printing-lists-as-tabular-data
-    """
     col_widths = [max(len(str(x)) for x in col) for col in zip(*rows, headers)]
     row_format = ("{{:{}}} " * len(headers)).format(*col_widths)
     lines = []
@@ -21,8 +17,6 @@ def tabulate(rows: List[List[Union[str, int]]], headers: List[str]) -> str:
 
 
 def ask_for_confirmation(message: str) -> bool:
-    """Ask user for confirmation with Y/N prompt.
-    Returns True for Y/yes, False for N/no/empty."""
     y = ("y", "yes", "1")
     n = ("n", "no", "0", "")
     full_message = f"{message} (y/n) "
@@ -35,7 +29,70 @@ def ask_for_confirmation(message: str) -> bool:
         print(f"Invalid input. Must be one of: yes/no/y/n or empty for no")
 
 
+def _save_draft_heads_cmd(argv):
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from .utils import (
+        _download,
+        _load_saved_draft_lm_heads,
+        _maybe_build_mtp_draft_lm_heads,
+        _maybe_quantize_mtp_fc,
+        load_model,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="mlx_lm.manage save-draft-heads",
+        description="Pre-build and save MTP draft lm_heads to draft_heads_{N}bit.safetensors.",
+    )
+    parser.add_argument("--model", required=True, help="Model path or HuggingFace repo ID.")
+    parser.add_argument(
+        "--bits",
+        required=True,
+        help="Comma-separated bit widths to build, e.g. '4' or '4,8'.",
+    )
+    parser.add_argument(
+        "--mtp-fc-bits",
+        type=int,
+        default=-1,
+        help="Quantize MTP fc layer to this precision before building heads.",
+    )
+    args = parser.parse_args(argv)
+
+    bits_list = [int(b.strip()) for b in args.bits.split(",")]
+    model_path = _download(args.model)
+
+    print(f"Loading model from {model_path} ...")
+    model, config = load_model(model_path, lazy=False)
+    _maybe_quantize_mtp_fc(model, config, bits=args.mtp_fc_bits)
+    _load_saved_draft_lm_heads(model, model_path)
+
+    lm = getattr(model, "language_model", model)
+    if not hasattr(lm, "mtp"):
+        print("Model has no MTP module. Nothing to save.")
+        return
+
+    for bits in bits_list:
+        _maybe_build_mtp_draft_lm_heads(model, [bits])
+        heads_dict = getattr(lm, "_mtp_draft_lm_heads", {})
+        head = heads_dict.get(bits)
+        if head is None:
+            print(f"  {bits}-bit: skipped (matches native precision).")
+            continue
+        out_path = model_path / f"draft_heads_{bits}bit.safetensors"
+        mx.eval(head.weight, head.scales, head.biases)
+        mx.save_safetensors(
+            str(out_path),
+            {"weight": head.weight, "scales": head.scales, "biases": head.biases},
+        )
+        print(f"  {bits}-bit: saved → {out_path}")
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "save-draft-heads":
+        _save_draft_heads_cmd(sys.argv[2:])
+        return
+
     parser = argparse.ArgumentParser(description="MLX Model Cache.")
     parser.add_argument(
         "--scan",

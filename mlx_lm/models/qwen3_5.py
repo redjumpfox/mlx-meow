@@ -467,16 +467,25 @@ class TextModel(nn.Module):
         hidden_states: mx.array,
         next_token_ids: mx.array,
         mtp_cache: Any,
+        return_mtp_hidden: bool = False,
+        head_bits: Optional[int] = None,
     ) -> mx.array:
         """Run the MTP head and apply the shared lm_head.
 
         Args:
-            hidden_states: Backbone pre-norm hidden state (B, N, H). N=1 during decode, N>1 during prompt prefill.
+            hidden_states: Backbone pre-norm hidden state (B, N, H).
             next_token_ids: Next token ids, shape (B, N).
             mtp_cache: KVCache entries for the MTP transformer layers.
+            return_mtp_hidden: Also return the pre-lm_head MTP hidden state for
+                chaining multi-depth draft proposals.
+            head_bits: When None (default) use the native ``lm_head`` at its
+                loaded precision.  When an integer, look up that precision in
+                ``_mtp_draft_lm_heads`` and use it instead (falls back to
+                ``lm_head`` if that precision was not pre-built).
 
         Returns:
-            logits of shape (B, N, vocab_size).
+            logits of shape (B, N, vocab_size), or (logits, mtp_hidden) if
+            return_mtp_hidden is True.
         """
         mtp_out = self.mtp(
             hidden_states,
@@ -485,8 +494,17 @@ class TextModel(nn.Module):
             mtp_cache,
         )
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(mtp_out)
-        return self.lm_head(mtp_out)
+            logits = self.model.embed_tokens.as_linear(mtp_out)
+        else:
+            if head_bits is not None:
+                heads = getattr(self, "_mtp_draft_lm_heads", {})
+                head = heads.get(head_bits, self.lm_head)
+            else:
+                head = self.lm_head
+            logits = head(mtp_out)
+        if return_mtp_hidden:
+            return logits, mtp_out
+        return logits
 
     @property
     def layers(self):
@@ -532,10 +550,27 @@ class TextModel(nn.Module):
             ".pre_fc_norm_embedding.weight",
             "mtp.norm.weight",
         )
+
+        # When the backbone is already in MLX format (no conv1d shift needed),
+        # the sidecar MTP weights may still be in raw HF format if they were
+        # created separately without applying the +1 convention.  Detect this
+        # by checking if the MTP-specific norm weights have mean < 0.5
+        # (raw HF norms are ≈1.0 before shift; stored without +1 they have mean near 0).
+        shift_mtp_norms = False
+        if not should_shift_norm_weights and hasattr(self, "mtp"):
+            mtp_norm_sfxs = (".pre_fc_norm_hidden.weight", ".pre_fc_norm_embedding.weight",
+                             ".input_layernorm.weight", ".post_attention_layernorm.weight")
+            for k, v in weights.items():
+                if "mtp." in k and any(k.endswith(s) for s in mtp_norm_sfxs):
+                    if v.ndim == 1 and float(v.mean()) < 0.5:
+                        shift_mtp_norms = True
+                        break
+
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
+            needs_shift = should_shift_norm_weights or (shift_mtp_norms and "mtp." in k)
+            if needs_shift and any(k.endswith(sfx) for sfx in norm_keys):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
         return weights
@@ -739,9 +774,13 @@ class Model(nn.Module):
         hidden_states: mx.array,
         next_token_ids: mx.array,
         mtp_cache: Any,
+        return_mtp_hidden: bool = False,
+        head_bits: Optional[int] = None,
     ) -> mx.array:
         """Delegate to language_model.mtp_forward. See TextModel.mtp_forward."""
-        return self.language_model.mtp_forward(hidden_states, next_token_ids, mtp_cache)
+        return self.language_model.mtp_forward(
+            hidden_states, next_token_ids, mtp_cache, return_mtp_hidden, head_bits
+        )
 
     def make_mtp_cache(self):
         """Return fresh KVCache entries for the MTP layer(s)."""

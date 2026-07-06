@@ -16,6 +16,7 @@ from typing import (
     Callable,
     Generator,
     List,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -42,6 +43,14 @@ from .models.cache import (
 from .sample_utils import categorical_sampling, make_sampler, make_sampler_chain
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
+
+
+class _DraftProposal(NamedTuple):
+    tok: mx.array
+    lp: mx.array
+    accept_lp: mx.array
+    xtc: Any
+
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -227,6 +236,75 @@ def setup_arg_parser():
         help="Use native Multi-Token Prediction for speculative decoding "
         "(requires a model with an MTP head, e.g. Qwen3.5).",
     )
+    parser.add_argument(
+        "--draft-head-bits",
+        type=int,
+        default=-1,
+        help=(
+            "Shorthand for --draft-head-schedule N: all draft positions use N-bit "
+            "lm_head. Ignored when --draft-head-schedule is also provided."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-fc-bits",
+        type=int,
+        default=-1,
+        help=(
+            "Quantize unquantized linear layers inside the MTP module (e.g. the "
+            "fc fusion layer in Qwen3.5/3.6 sidecars) to this precision at load "
+            "time. Corrects sidecar models that bypassed the quantization pipeline. "
+            "Default -1 (disabled, model loaded as-is)."
+        ),
+    )
+    parser.add_argument(
+        "--draft-head-schedule",
+        type=lambda s: [
+            None if v.strip().lower() in ("full", "f", "native", "none")
+            else int(v.strip())
+            for v in reversed(s.split(","))
+        ],
+        default=None,
+        metavar="SCHEDULE",
+        help=(
+            "Per-position lm_head precision schedule, left=first position, "
+            "right=last. Entries are bit widths (4, 8, ...) or 'native'/'full' "
+            "for the model's original lm_head. The leftmost value repeats for "
+            "earlier positions when the chain is longer than the schedule. "
+            "Depth-aware: the rightmost value always applies to the last draft "
+            "position regardless of current depth. Examples: '4' (all=4-bit), "
+            "'native,4' (last=4-bit, rest=native), '8,8,4' (two 8-bit then 4-bit). "
+            "Overrides --draft-head-bits when both are set."
+        ),
+    )
+    parser.add_argument(
+        "--draft-head-policy",
+        type=str,
+        default="fixed",
+        metavar="POLICY",
+        help=(
+            "Controls when the --draft-head-schedule bits are applied. "
+            "'fixed' (default): always use the scheduled bits. "
+            "'adaptive' or 'adaptive:T': use scheduled bits for a position only "
+            "when its sliding-window acceptance rate >= T (default T=0.8); "
+            "otherwise fall back to the native lm_head. "
+            "Example: --draft-head-policy adaptive:0.85"
+        ),
+    )
+    parser.add_argument(
+        "--draft-algorithm",
+        type=str,
+        default="greedy",
+        metavar="ALGO",
+        help=(
+            "Depth and precision adaptation algorithm. "
+            "'greedy' (default): depth uses N/(N+1) threshold heuristic. "
+            "'optimal': depth uses real-time measured backbone/MTP times for "
+            "true throughput-maximising depth per round (recommended for adaptive mode). "
+            "'optimal:bound': depth optimal + conservative theoretical delta-alpha for precision. "
+            "'optimal:probe' or 'optimal:probe:K': depth optimal + periodic full-head "
+            "probing every K rounds (default K=20) to measure actual per-position delta-alpha."
+        ),
+    )
     return parser
 
 
@@ -301,6 +379,9 @@ class GenerationResponse:
     generation_tokens: int
     generation_tps: float
     peak_memory: float
+    draft_accepted: int = 0
+    draft_proposed: int = 0
+    draft_depth: int = -1
     finish_reason: Optional[str] = None
 
 
@@ -667,12 +748,18 @@ def mtp_generate_step(
     model: nn.Module,
     *,
     max_tokens: int = 256,
+    num_draft_tokens: int = 1,
+    min_draft_tokens: int = -1,
+    max_draft_tokens: int = -1,
+    draft_threshold: float = -1.0,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 2048,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    use_gdn_tape: bool = False,
+    use_mlp_fuse: bool = False,
     input_embeddings: Optional[mx.array] = None,
     temp: float = 0.0,
     top_p: float = 0.0,
@@ -682,21 +769,34 @@ def mtp_generate_step(
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
     xtc_special_tokens: List[int] = [],
+    _mtp_stats: Optional[dict] = None,
+    draft_head_schedule: Optional[List[Optional[int]]] = None,
+    draft_head_policy: str = "fixed",
+    draft_algorithm: str = "greedy",
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
-    """A generator that uses the model's native MTP head for speculative decoding.
+    _min_n = min_draft_tokens if min_draft_tokens >= 0 else num_draft_tokens
+    _max_n = max_draft_tokens if max_draft_tokens >= 0 else num_draft_tokens
+    _dynamic = _min_n != _max_n
+    _RAMP_INTERVAL = 20
 
-    Each iteration runs one backbone forward pass over the current token and its
-    pending draft, then one MTP forward pass to propose the next draft.  Up to 2
-    tokens are emitted per backbone step: one always-accepted backbone token and
-    one conditionally-accepted draft token.
+    _known_policies = ("fixed", "adaptive")
+    if not any(draft_head_policy.lower().startswith(p) for p in _known_policies):
+        raise ValueError(
+            f"Unknown draft_head_policy {draft_head_policy!r}. "
+            f"Expected 'fixed' or 'adaptive' or 'adaptive:T'."
+        )
 
-    The model must implement ``mtp_forward(hidden, next_tok, mtp_cache)`` and
-    support ``return_hidden=True`` in its ``__call__``.
+    _algo_parts = draft_algorithm.lower().split(":")
+    _algo_base = _algo_parts[0]
+    if _algo_base not in ("greedy", "optimal"):
+        raise ValueError(
+            f"Unknown draft_algorithm {draft_algorithm!r}. "
+            f"Expected 'greedy', 'optimal', 'optimal:bound', or 'optimal:probe[:K]'."
+        )
+    _algo_use_bound = len(_algo_parts) > 1 and _algo_parts[1] == "bound"
+    _algo_use_probe = len(_algo_parts) > 1 and _algo_parts[1] == "probe"
+    _algo_probe_interval = int(_algo_parts[2]) if (_algo_use_probe and len(_algo_parts) > 2) else 20
 
-    Yields:
-        Tuple[mx.array, mx.array, bool]: (token, log-probabilities, from_draft).
-            ``from_draft`` is ``True`` when the token came from the MTP head.
-    """
     y = prompt.astype(mx.uint32)
     prev_tokens = None
 
@@ -704,13 +804,50 @@ def mtp_generate_step(
         model_cache = cache.make_prompt_cache(model)
         mtp_cache = model.make_mtp_cache()
     else:
-        # Split a pre-built cache at backbone length.  If MTP entries are
-        # absent (e.g. cache created by make_prompt_cache), create them.
         n_main = len(model.layers)
         model_cache = prompt_cache[:n_main]
         mtp_cache = prompt_cache[n_main:] or model.make_mtp_cache()
 
     _is_greedy = temp == 0
+
+    if use_mlp_fuse:
+        try:
+            from .models.mlp_fused import patch_model_mlp_fused
+            patch_model_mlp_fused(model)
+        except Exception:
+            pass
+
+    _gdn_tape_enabled = use_gdn_tape and mx.metal.is_available()
+
+    _policy_lower = draft_head_policy.lower()
+    if _policy_lower.startswith("adaptive"):
+        _adaptive_precision = True
+        parts = _policy_lower.split(":")
+        _adaptive_threshold = float(parts[1]) if len(parts) > 1 else 0.8
+    else:
+        _adaptive_precision = False
+        _adaptive_threshold = 0.8
+
+    _n_slots = max(_max_n, 1)
+    _pos_proposed: List[int] = [0] * _n_slots
+    _pos_accepted: List[int] = [0] * _n_slots
+    _pos_history: List[List[int]] = [[] for _ in range(_n_slots)]
+
+    def _bits_at(pos_i: int, total_n: int) -> Optional[int]:
+        if not draft_head_schedule:
+            return None
+        from_last = total_n - 1 - pos_i
+        sched_idx = min(from_last, len(draft_head_schedule) - 1)
+        target = draft_head_schedule[sched_idx]
+        if target is None:
+            return None
+        if _adaptive_precision:
+            slot = min(from_last, _n_slots - 1)
+            if _pos_proposed[slot] > 0:
+                rate = _pos_accepted[slot] / _pos_proposed[slot]
+                if rate < _adaptive_threshold:
+                    return None
+        return target
 
     _filter_chain, _xtc_cell = (
         make_sampler_chain(
@@ -747,7 +884,6 @@ def mtp_generate_step(
             for f in _filter_chain:
                 masked = f(masked)
             token = categorical_sampling(masked, temp)
-            # lp_accept must reflect the same filtered distribution as token.
             scaled = masked / temp
             lp_accept = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
         elif _is_greedy:
@@ -764,28 +900,36 @@ def mtp_generate_step(
             if hasattr(c, "rollback_state"):
                 c.rollback_state = None
 
-    def _rollback_draft():
-        """Restore caches to the state after the confirmed token.
-
-        SSM layers (ArraysCache): restore the conv/ssm snapshot saved by
-        GatedDeltaNet after the confirmed token.
-        Attention layers (KVCache): trim the draft-token entry.
-        """
+    def _rollback_draft(trim_amount=1, restore_ssm=True):
         for c in model_cache:
-            if hasattr(c, "rollback_state") and c.rollback_state is not None:
-                conv_snap, ssm_snap = c.rollback_state
-                c[0] = conv_snap
-                c[1] = ssm_snap
+            if hasattr(c, "rollback_state"):
+                if restore_ssm and c.rollback_state is not None:
+                    conv_snap, ssm_snap = c.rollback_state
+                    c[0] = conv_snap
+                    c[1] = ssm_snap
                 c.rollback_state = None
-            elif c.is_trimmable():
-                c.trim(1)
+            elif c.is_trimmable() and trim_amount > 0:
+                c.trim(trim_amount)
 
-    def _step_backbone(y, prev_tokens, n_predict=1, n_confirmed=0, xtc_draw=None):
-        """Run the backbone on ``y`` and return (tokens, logprobs, accept_lps, hidden, prev_tokens)."""
+    def _trim_mtp_cache(n):
+        for c in mtp_cache:
+            if c.is_trimmable():
+                c.trim(n)
+
+    def _step_backbone(y, prev_tokens, n_predict=1, n_confirmed=0, xtc_draw=None,
+                       _capture_gdn=False):
         with mx.stream(generation_stream):
-            logits, hidden = model(
-                y[None], cache=model_cache, return_hidden=True, n_confirmed=n_confirmed
-            )
+            if _capture_gdn:
+                from .models.gdn_tape import backbone_forward_with_gdn_tape
+                logits_full, hidden, _gdn_captures = backbone_forward_with_gdn_tape(
+                    model, y[None], model_cache, return_hidden=True, n_confirmed=n_confirmed
+                )
+                logits = logits_full[:, -n_predict:, :]
+            else:
+                _gdn_captures = {}
+                logits, hidden = model(
+                    y[None], cache=model_cache, return_hidden=True, n_confirmed=n_confirmed
+                )
             logits = logits[:, -n_predict:, :]
             quantize_cache_fn(model_cache)
             toks, lps, accept_lps = [], [], []
@@ -796,7 +940,6 @@ def mtp_generate_step(
                         if prev_tokens is not None
                         else y[i : i + 1]
                     )
-                # Pass the shared XTC draw only for position 0 (the verify position).
                 draw = xtc_draw if i == 0 else None
                 tok, lp, alp = _process_and_sample(
                     prev_tokens, logits[:, i, :].squeeze(0), draw
@@ -804,6 +947,11 @@ def mtp_generate_step(
                 toks.append(tok)
                 lps.append(lp)
                 accept_lps.append(alp)
+            if _capture_gdn:
+                return (
+                    mx.stack(toks), mx.stack(lps), mx.stack(accept_lps),
+                    hidden, prev_tokens, _gdn_captures,
+                )
             return (
                 mx.stack(toks),
                 mx.stack(lps),
@@ -812,12 +960,7 @@ def mtp_generate_step(
                 prev_tokens,
             )
 
-    def _step_mtp(hidden_last, main_tok, prev_tokens, *, cache_commit=None):
-        """Run the MTP head and return (draft_token, draft_logprobs, draft_accept_lp, xtc_draw).
-
-        cache_commit: (hidden, tok) prepended as a cache-alignment position so that the
-        accepted draft token is committed to mtp_cache in the same batched forward.
-        """
+    def _step_mtp(hidden_last, main_tok, prev_tokens, *, cache_commit=None, return_hidden=False, head_bits=None):
         if cache_commit is not None:
             align_h, align_tok = cache_commit
             hidden_last = mx.concatenate([align_h, hidden_last], axis=1)
@@ -827,7 +970,16 @@ def mtp_generate_step(
         else:
             next_ids = main_tok.reshape(1, 1)
         with mx.stream(generation_stream):
-            mtp_logits = model.mtp_forward(hidden_last, next_ids, mtp_cache)
+            result = model.mtp_forward(
+                hidden_last, next_ids, mtp_cache, return_mtp_hidden=return_hidden,
+                head_bits=head_bits,
+            )
+            if return_hidden:
+                mtp_logits, mtp_hidden = result
+                out_hidden = mtp_hidden[:, -1:, :]
+            else:
+                mtp_logits = result
+                out_hidden = None
             quantize_cache_fn(mtp_cache)
             mtp_logits = mtp_logits[:, -1, :].squeeze(0)
             if logits_processors:
@@ -838,15 +990,13 @@ def mtp_generate_step(
                 )
             else:
                 tokens_for_proc = prev_tokens
-            # Draw the XTC boolean once here so the verify step can reuse it.
             xtc_draw = mx.random.uniform() if _xtc_cell is not None else None
             draft_tok, draft_lp, draft_accept_lp = _process_and_sample(
                 tokens_for_proc, mtp_logits, xtc_draw
             )
-        return draft_tok, draft_lp, draft_accept_lp, xtc_draw
+        return draft_tok, draft_lp, draft_accept_lp, xtc_draw, out_hidden
 
     def _prefill(y, input_embeddings):
-        # Leave exactly 1 token for _step_backbone so the decode loop starts clean.
         total = len(input_embeddings) if input_embeddings is not None else y.size
         while total > 1:
             n = min(prefill_step_size, total - 1)
@@ -874,109 +1024,281 @@ def mtp_generate_step(
 
     ntoks = 0
     last_cache_block = 0
-    draft_tok = draft_lp = draft_accept_lp = draft_xtc_draw = None
+    all_drafts = None
+    current_n = _max_n
+    _dry_runs = 0
+    _sw_proposed = 0
+    _sw_accepted = 0
+    _SW_SIZE = 8
+    _sw_history = []
+    _EMA_A = 0.3
+    _t_backbone: dict = {}
+    _t_mtp: Optional[float] = None
+    _optimal_rounds = 0
+    _OPTIMAL_WARMUP = 5
+    _probe_countdown = _algo_probe_interval
+    _delta_alpha: Optional[float] = None
+    _probe_alpha_acc: Optional[float] = None
+    _is_probe_round = False
 
     while ntoks < max_tokens:
-        if draft_tok is None:
-            # No pending draft: run backbone only, then generate first draft.
-            toks, lps, accept_lps, hidden, prev_tokens = _step_backbone(
-                y, prev_tokens, n_predict=1
-            )
+        if all_drafts is None:
+            toks, lps, _, hidden, prev_tokens = _step_backbone(y, prev_tokens, n_predict=1)
             mx.eval(toks)
             main_tok, main_lp = toks[0], lps[0]
             ntoks += 1
             yield main_tok.item(), main_lp, False
             if ntoks >= max_tokens:
                 return
-            hidden_at_main = hidden[:, -1:, :]
-            draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = _step_mtp(
-                hidden_at_main, main_tok, prev_tokens
-            )
-            mx.eval(draft_tok)
+
+            if _mtp_stats is not None:
+                _mtp_stats["current_depth"] = current_n
+                if current_n > _mtp_stats["peak_depth"]:
+                    _mtp_stats["peak_depth"] = current_n
+
+            probe_n = current_n
+            if _dynamic and current_n == 0:
+                _dry_runs += 1
+                if _dry_runs >= _RAMP_INTERVAL:
+                    probe_n = 1
+                    _dry_runs = 0
+
+            if probe_n > 0:
+                h = hidden[:, -1:, :]
+                tok = main_tok
+                all_drafts = []
+                _t0_mtp = time.perf_counter() if _algo_base == "optimal" else None
+                for i in range(probe_n):
+                    need_h = i < probe_n - 1
+                    hb = None if _is_probe_round else _bits_at(i, probe_n)
+                    d_tok, d_lp, d_accept_lp, d_xtc, next_h = _step_mtp(
+                        h, tok, prev_tokens, return_hidden=need_h,
+                        head_bits=hb,
+                    )
+                    all_drafts.append(_DraftProposal(d_tok, d_lp, d_accept_lp, d_xtc))
+                    tok = d_tok
+                    if need_h:
+                        h = next_h
+                mx.eval(*[d.tok for d in all_drafts])
+                if _t0_mtp is not None and probe_n > 0:
+                    _t_per = (time.perf_counter() - _t0_mtp) * 1000 / probe_n
+                    _t_mtp = _t_per if _t_mtp is None else _EMA_A * _t_per + (1 - _EMA_A) * _t_mtp
+            else:
+                all_drafts = None
             y = mx.array([main_tok.item()], mx.uint32)
         else:
-            # Verify draft: run backbone over [y, draft_tok].
-            # n_confirmed=1 causes GatedDeltaNet to snapshot its SSM/conv state
-            # after the confirmed token y, enabling exact rollback on rejection.
-            y_with_draft = mx.concatenate([y, mx.array([draft_tok.item()], mx.uint32)])
-            toks, lps, accept_lps, hidden, prev_tokens = _step_backbone(
-                y_with_draft,
+            N = len(all_drafts)
+            first_draft_tok = all_drafts[0].tok
+            draft_ids = mx.concatenate([d.tok.reshape(1) for d in all_drafts])
+            y_with_drafts = mx.concatenate([y, draft_ids])
+            _t0_backbone = time.perf_counter() if _algo_base == "optimal" else None
+            _do_capture = _gdn_tape_enabled and N > 0
+            _verify_result = _step_backbone(
+                y_with_drafts,
                 prev_tokens,
-                n_predict=2,
+                n_predict=N + 1,
                 n_confirmed=1,
-                xtc_draw=draft_xtc_draw,
+                xtc_draw=all_drafts[0].xtc,
+                _capture_gdn=_do_capture,
             )
-            u = mx.random.uniform()
-            mx.eval(toks, draft_tok, u)
-
-            verify_pred, bonus_tok = toks[0], toks[1]
-            verify_lp, bonus_lp = lps[0], lps[1]
-            verify_accept_lp = accept_lps[0]
-            draft_tok_id = draft_tok.item()
-
+            if _do_capture:
+                toks, lps, accept_lps, hidden, prev_tokens, _gdn_captures = _verify_result
+            else:
+                toks, lps, accept_lps, hidden, prev_tokens = _verify_result
+                _gdn_captures = {}
             if _is_greedy:
-                accept = verify_pred.item() == draft_tok_id
+                accept_vec = toks[:N] == draft_ids
+                k_mx = mx.sum(mx.cumprod(accept_vec.astype(mx.uint32)))
+                corrected_mx = toks[k_mx]
+                mx.eval(k_mx, corrected_mx)
+                k_accepted = k_mx.item()
+                corrected_tok_id = corrected_mx.item() if k_accepted < N else None
             else:
-                # Probabilistic acceptance: min(1, p_target/p_draft) with temp-adjusted logprobs.
-                log_accept = (
-                    verify_accept_lp[draft_tok_id] - draft_accept_lp[draft_tok_id]
-                ).item()
-                accept = log_accept >= 0 or u.item() < math.exp(log_accept)
-
-            hidden_at_confirmed = hidden[:, 0:1, :]
-            hidden_at_draft = hidden[:, 1:2, :]
-
-            if accept:
-                _clear_rollback()
-                ntoks += 1
-                yield draft_tok_id, draft_lp, True
-                if ntoks >= max_tokens:
-                    return
-                ntoks += 1
-                yield bonus_tok.item(), bonus_lp, False
-                if ntoks >= max_tokens:
-                    return
-                # Next draft: one batched forward aligns the cache for the
-                # accepted draft token and generates the next draft together.
-                draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = _step_mtp(
-                    hidden_at_draft,
-                    bonus_tok,
-                    prev_tokens,
-                    cache_commit=(hidden_at_confirmed, draft_tok),
-                )
-                mx.eval(draft_tok)
-                y = mx.array([bonus_tok.item()], mx.uint32)
-            else:
-                _rollback_draft()
-                if logits_processors and prev_tokens is not None:
-                    prev_tokens = prev_tokens[:-1]  # discard rejected draft token
-                verify_tok_id = verify_pred.item()
-                if not _is_greedy:
-                    # Sample from residual distribution max(p_target - p_draft, 0) / Z
-                    # (Leviathan et al. 2022 §2.3; Chen et al. 2023). Guarantees the
-                    # output marginal equals the target distribution exactly.
-                    # Both distributions are temperature-adjusted to match sampling.
-                    p_target = mx.exp(verify_accept_lp)
-                    p_draft = mx.exp(draft_accept_lp)
-                    residual = mx.maximum(p_target - p_draft, 0.0)
+                # Single mx.random.uniform call produces N independent samples
+                # from properly advancing RNG state, avoiding correlation that
+                # would occur if N lazy nodes shared the same state counter.
+                u_arr = mx.random.uniform(shape=(N,))
+                accept_lps_mat = mx.stack([accept_lps[i] for i in range(N)])
+                draft_lps_mat  = mx.stack([all_drafts[i].accept_lp for i in range(N)])
+                gathered_accept = accept_lps_mat[mx.arange(N), draft_ids]
+                gathered_draft  = draft_lps_mat[mx.arange(N), draft_ids]
+                # fp32 prevents BF16 underflow in p/q ratio at small token probs.
+                log_accepts = (gathered_accept - gathered_draft).astype(mx.float32)
+                accept_vec = (log_accepts >= 0.0) | (u_arr < mx.exp(log_accepts))
+                k_mx = mx.sum(mx.cumprod(accept_vec.astype(mx.uint32)))
+                mx.eval(k_mx, toks)
+                k_accepted = k_mx.item()
+                corrected_tok_id = None
+                if k_accepted < N:
+                    p_t = mx.exp(accept_lps[k_accepted])
+                    p_d = mx.exp(all_drafts[k_accepted].accept_lp)
+                    residual = mx.maximum(p_t - p_d, 0.0)
                     z = residual.sum(keepdims=True)
-                    dist = mx.where(z > 0, residual, p_target)
-                    # categorical treats -inf log-prob as p=0.
-                    verify_tok_id = mx.random.categorical(
+                    dist = mx.where(z > 0, residual, p_t)
+                    corrected_tok_id = mx.random.categorical(
                         mx.log(dist).reshape(1, -1)
                     ).item()
+
+            if _mtp_stats is not None:
+                _mtp_stats["proposed"] += N
+                _mtp_stats["accepted"] += k_accepted
+
+            if _adaptive_precision and draft_head_schedule:
+                for pi in range(N):
+                    acc = 1 if k_accepted > pi else 0
+                    from_last = N - 1 - pi
+                    slot = min(from_last, _n_slots - 1)
+                    _pos_history[slot].append(acc)
+                    if len(_pos_history[slot]) > _SW_SIZE:
+                        old = _pos_history[slot].pop(0)
+                        _pos_proposed[slot] -= 1
+                        _pos_accepted[slot] -= old
+                    _pos_proposed[slot] += 1
+                    _pos_accepted[slot] += acc
+
+            if _t0_backbone is not None:
+                elapsed = (time.perf_counter() - _t0_backbone) * 1000
+                n_in = N + 1
+                prev = _t_backbone.get(n_in)
+                _t_backbone[n_in] = elapsed if prev is None else _EMA_A * elapsed + (1 - _EMA_A) * prev
+
+            if _is_probe_round and _algo_use_probe:
+                probe_rate = k_accepted / N if N > 0 else 1.0
+                if _probe_alpha_acc is not None:
+                    measured_delta = _probe_alpha_acc - probe_rate
+                    _delta_alpha = (measured_delta if _delta_alpha is None
+                                    else _EMA_A * measured_delta + (1 - _EMA_A) * _delta_alpha)
+                _is_probe_round = False
+            else:
+                round_rate = k_accepted / N if N > 0 else 1.0
+                _probe_alpha_acc = (round_rate if _probe_alpha_acc is None
+                                    else _EMA_A * round_rate + (1 - _EMA_A) * _probe_alpha_acc)
+
+            if _dynamic:
+                _sw_history.append((N, k_accepted))
+                if len(_sw_history) > _SW_SIZE:
+                    old_p, old_a = _sw_history.pop(0)
+                    _sw_proposed -= old_p
+                    _sw_accepted -= old_a
+                _sw_proposed += N
+                _sw_accepted += k_accepted
+                sw_rate = _sw_accepted / _sw_proposed if _sw_proposed > 0 else 1.0
+
+                _optimal_rounds += 1
+                if _algo_base == "optimal" and _t_backbone.get(1) and _optimal_rounds >= _OPTIMAL_WARMUP:
+                    def _expected_toks(n_depth, alpha):
+                        e = sum((k + 1) * alpha ** k * (1 - alpha) for k in range(n_depth))
+                        return e + (n_depth + 1) * alpha ** n_depth
+
+                    def _throughput(n_depth, alpha):
+                        t_b = _t_backbone.get(n_depth + 1,
+                                               _t_backbone[1] * (n_depth + 1))
+                        t_m = _t_mtp or 0.0
+                        cost = t_b + n_depth * t_m
+                        return _expected_toks(n_depth, alpha) / cost if cost > 0 else 0.0
+
+                    best_n = _min_n
+                    best_tp = _throughput(_min_n, sw_rate)
+                    for n_cand in range(_min_n + 1, _max_n + 1):
+                        tp = _throughput(n_cand, sw_rate)
+                        if tp > best_tp:
+                            best_tp = tp
+                            best_n = n_cand
+                    current_n = best_n
+                else:
+                    effective_threshold = (
+                        current_n / (current_n + 1) if draft_threshold < 0 else draft_threshold
+                    )
+                    if k_accepted == N and current_n < _max_n:
+                        current_n += 1
+                    elif len(_sw_history) >= 2 and sw_rate < effective_threshold and current_n > _min_n:
+                        current_n -= 1
+
+                if _mtp_stats is not None:
+                    _mtp_stats["current_depth"] = current_n
+                    if current_n > _mtp_stats["peak_depth"]:
+                        _mtp_stats["peak_depth"] = current_n
+
+                if _algo_use_probe and _dynamic:
+                    _probe_countdown -= 1
+                    if _probe_countdown <= 0:
+                        _is_probe_round = True
+                        _probe_countdown = _algo_probe_interval
+
+            trim_backbone = N - k_accepted
+            trim_mtp = N - 1 - k_accepted
+            if trim_backbone > 0:
+                _rollback_draft(
+                    trim_amount=trim_backbone, restore_ssm=(k_accepted == 0)
+                )
+                if trim_mtp > 0:
+                    _trim_mtp_cache(trim_mtp)
+                if _gdn_captures and 0 < k_accepted < N:
+                    try:
+                        from .models.gdn_tape import commit_gdn_state_at
+                        commit_gdn_state_at(model_cache, _gdn_captures, k_accepted, N)
+                    except Exception:
+                        pass
+            else:
+                _clear_rollback()
+
+            for i in range(k_accepted):
                 ntoks += 1
-                yield verify_tok_id, verify_lp, False
+                yield all_drafts[i].tok.item(), all_drafts[i].lp, True
                 if ntoks >= max_tokens:
                     return
-                # Next draft from MTP at y's hidden state.
-                draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = _step_mtp(
-                    hidden_at_confirmed,
-                    mx.array([verify_tok_id], mx.uint32),
-                    prev_tokens,
-                )
-                mx.eval(draft_tok)
-                y = mx.array([verify_tok_id], mx.uint32)
+
+            if k_accepted == N:
+                bonus_tok = toks[N]
+                ntoks += 1
+                yield bonus_tok.item(), lps[N], False
+                if ntoks >= max_tokens:
+                    return
+                if current_n > 0:
+                    h = hidden[:, N : N + 1, :]
+                    tok = bonus_tok
+                    all_drafts = []
+                    for i in range(current_n):
+                        commit = (hidden[:, 0:1, :], first_draft_tok) if i == 0 else None
+                        need_h = i < current_n - 1
+                        d_tok, d_lp, d_accept_lp, d_xtc, next_h = _step_mtp(
+                            h, tok, prev_tokens, cache_commit=commit, return_hidden=need_h,
+                            head_bits=_bits_at(i, current_n),
+                        )
+                        all_drafts.append(_DraftProposal(d_tok, d_lp, d_accept_lp, d_xtc))
+                        tok = d_tok
+                        if need_h:
+                            h = next_h
+                    mx.eval(*[d.tok for d in all_drafts])
+                else:
+                    all_drafts = None
+                y = mx.array([bonus_tok.item()], mx.uint32)
+            else:
+                ntoks += 1
+                yield corrected_tok_id, lps[k_accepted], False
+                if ntoks >= max_tokens:
+                    return
+                if logits_processors and prev_tokens is not None:
+                    prev_tokens = prev_tokens[:-1]
+                if current_n > 0:
+                    h = hidden[:, k_accepted : k_accepted + 1, :]
+                    tok = mx.array([corrected_tok_id], mx.uint32)
+                    all_drafts = []
+                    for i in range(current_n):
+                        need_h = i < current_n - 1
+                        d_tok, d_lp, d_accept_lp, d_xtc, next_h = _step_mtp(
+                            h, tok, prev_tokens, return_hidden=need_h,
+                            head_bits=_bits_at(i, current_n),
+                        )
+                        all_drafts.append(_DraftProposal(d_tok, d_lp, d_accept_lp, d_xtc))
+                        tok = d_tok
+                        if need_h:
+                            h = next_h
+                    mx.eval(*[d.tok for d in all_drafts])
+                else:
+                    all_drafts = None
+                y = mx.array([corrected_tok_id], mx.uint32)
+
         block = ntoks // _CACHE_CLEAR_INTERVAL
         if block > last_cache_block:
             mx.clear_cache()
@@ -1037,6 +1359,7 @@ def stream_generate(
     detokenizer = tokenizer.detokenizer
 
     kwargs["max_tokens"] = max_tokens
+    _mtp_stats = None
 
     if draft_model is not None:
         kwargs.pop("max_kv_size", None)
@@ -1047,11 +1370,29 @@ def stream_generate(
     elif mtp and hasattr(model, "mtp_forward"):
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
-        kwargs.pop("num_draft_tokens", None)
+        num_draft_tokens = kwargs.pop("num_draft_tokens", 1)
+        min_draft_tokens = kwargs.pop("min_draft_tokens", -1)
+        max_draft_tokens = kwargs.pop("max_draft_tokens", -1)
+        draft_threshold = kwargs.pop("draft_threshold", -1.0)
+        draft_head_schedule = kwargs.pop("draft_head_schedule", None)
+        draft_head_policy = kwargs.pop("draft_head_policy", "fixed")
+        draft_algorithm = kwargs.pop("draft_algorithm", "greedy")
+        use_gdn_tape = kwargs.pop("use_gdn_tape", False)
+        use_mlp_fuse = kwargs.pop("use_mlp_fuse", False)
         kwargs.pop("sampler", None)  # mtp_generate_step does not accept sampler=
+        _mtp_stats = {"proposed": 0, "accepted": 0, "current_depth": num_draft_tokens, "peak_depth": num_draft_tokens}
         token_generator = mtp_generate_step(
             prompt,
             model,
+            num_draft_tokens=num_draft_tokens,
+            min_draft_tokens=min_draft_tokens,
+            max_draft_tokens=max_draft_tokens,
+            draft_threshold=draft_threshold,
+            draft_head_schedule=draft_head_schedule,
+            draft_head_policy=draft_head_policy,
+            draft_algorithm=draft_algorithm,
+            use_gdn_tape=use_gdn_tape,
+            use_mlp_fuse=use_mlp_fuse,
             temp=temp,
             top_p=top_p,
             top_k=top_k,
@@ -1060,6 +1401,7 @@ def stream_generate(
             xtc_probability=xtc_probability,
             xtc_threshold=xtc_threshold,
             xtc_special_tokens=xtc_special_tokens,
+            _mtp_stats=_mtp_stats,
             **kwargs,
         )
     else:
@@ -1070,6 +1412,12 @@ def stream_generate(
                 stacklevel=2,
             )
         kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("min_draft_tokens", None)
+        kwargs.pop("max_draft_tokens", None)
+        kwargs.pop("draft_threshold", None)
+        kwargs.pop("draft_head_schedule", None)
+        kwargs.pop("draft_head_policy", None)
+        kwargs.pop("draft_algorithm", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -1099,6 +1447,9 @@ def stream_generate(
                 generation_tokens=n + 1,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
+                draft_accepted=_mtp_stats["accepted"] if _mtp_stats is not None else 0,
+                draft_proposed=_mtp_stats["proposed"] if _mtp_stats is not None else 0,
+                draft_depth=_mtp_stats["peak_depth"] if _mtp_stats is not None else -1,
                 finish_reason=None,
             )
 
@@ -1113,6 +1464,9 @@ def stream_generate(
             generation_tokens=n + 1,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
+            draft_accepted=_mtp_stats["accepted"] if _mtp_stats is not None else 0,
+            draft_proposed=_mtp_stats["proposed"] if _mtp_stats is not None else 0,
+            draft_depth=_mtp_stats["current_depth"] if _mtp_stats is not None else -1,
             finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
         )
 
@@ -1160,6 +1514,12 @@ def generate(
             f"{response.generation_tps:.3f} tokens-per-sec"
         )
         print(f"Peak memory: {response.peak_memory:.3f} GB")
+        if response.draft_proposed > 0:
+            rate = 100.0 * response.draft_accepted / response.draft_proposed
+            print(
+                f"Draft acceptance: {response.draft_accepted}/{response.draft_proposed}"
+                f" ({rate:.1f}%)"
+            )
     return text
 
 
@@ -2352,6 +2712,10 @@ def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
 
+    policy = getattr(args, "draft_head_policy", "fixed").lower()
+    if not (policy == "fixed" or policy.startswith("adaptive")):
+        parser.error(f"--draft-head-policy must be 'fixed' or 'adaptive[:T]', got {policy!r}")
+
     if args.seed is not None:
         mx.random.seed(args.seed)
 
@@ -2396,6 +2760,9 @@ def main():
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
         trust_remote_code=args.trust_remote_code,
+        draft_head_bits=getattr(args, "draft_head_bits", -1),
+        draft_head_schedule=getattr(args, "draft_head_schedule", None),
+        mtp_fc_bits=getattr(args, "mtp_fc_bits", -1),
     )
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
@@ -2470,6 +2837,9 @@ def main():
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
         mtp=args.mtp,
+        draft_head_schedule=getattr(args, "draft_head_schedule", None),
+        draft_head_policy=getattr(args, "draft_head_policy", "fixed"),
+        draft_algorithm=getattr(args, "draft_algorithm", "greedy"),
     )
     if not args.verbose:
         print(response)

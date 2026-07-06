@@ -188,6 +188,9 @@ class GenerationArguments:
 
     max_tokens: int
     num_draft_tokens: int
+    min_draft_tokens: int
+    max_draft_tokens: int
+    draft_threshold: float
     logprobs: bool
     top_logprobs: int
     seed: Optional[int]
@@ -345,11 +348,15 @@ class ModelProvider:
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
         else:
+            mtp_active_load = getattr(self.cli_args, "mtp", False) and not self.is_distributed
             model, tokenizer = load(
                 model_path,
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
                 trust_remote_code=self.cli_args.trust_remote_code,
+                draft_head_bits=getattr(self.cli_args, "draft_head_bits", -1),
+                draft_head_schedule=getattr(self.cli_args, "draft_head_schedule", None),
+                mtp_fc_bits=getattr(self.cli_args, "mtp_fc_bits", -1),
             )
 
         # Use the default chat template if needed
@@ -789,6 +796,10 @@ class ResponseGenerator:
                         "detokenizer": tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
+                        "t_insert": time.time(),
+                        "t_gen_start": None,
+                        "n_prompt": len(prompt),
+                        "n_gen": 0,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -866,6 +877,8 @@ class ResponseGenerator:
                     for r in prompt_responses:
                         result = batch_results[r.uid]
                         result["rqueue"].put(r.progress)
+                        if r.end_of_prompt and result["t_gen_start"] is None:
+                            result["t_gen_start"] = time.time()
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
 
@@ -890,6 +903,7 @@ class ResponseGenerator:
                     for r in gen_responses:
                         result = batch_results[r.uid]
                         result["detokenizer"].add_token(r.token)
+                        result["n_gen"] += 1
                         result["rqueue"].put(
                             Response(
                                 result["detokenizer"].last_segment,
@@ -913,6 +927,18 @@ class ResponseGenerator:
                                 r.all_tokens[:],
                                 r.prompt_cache,
                                 cache_type="assistant",
+                            )
+                            t_now = time.time()
+                            t_gen_start = result["t_gen_start"] or t_now
+                            gen_elapsed = t_now - t_gen_start
+                            prompt_elapsed = t_gen_start - result["t_insert"]
+                            n_prompt = result["n_prompt"]
+                            n_gen = result["n_gen"]
+                            prompt_tps = n_prompt / prompt_elapsed if prompt_elapsed > 0 else 0
+                            gen_tps = n_gen / gen_elapsed if gen_elapsed > 0 else 0
+                            logging.info(
+                                f"prompt={n_prompt} tokens ({prompt_tps:.1f} t/s), "
+                                f"gen={n_gen} tokens ({gen_tps:.1f} t/s)"
                             )
                             del batch_results[r.uid]
 
@@ -975,10 +1001,15 @@ class ResponseGenerator:
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
+            mtp_active = getattr(self.cli_args, "mtp", False) and hasattr(
+                model, "make_mtp_cache"
+            )
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+                elif mtp_active:
+                    cache += model.make_mtp_cache()
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -991,6 +1022,14 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
+                min_draft_tokens=args.min_draft_tokens,
+                max_draft_tokens=args.max_draft_tokens,
+                draft_threshold=args.draft_threshold,
+                draft_head_schedule=getattr(self.cli_args, "draft_head_schedule", None),
+                draft_head_policy=getattr(self.cli_args, "draft_head_policy", "fixed"),
+                draft_algorithm=getattr(self.cli_args, "draft_algorithm", "greedy"),
+                use_gdn_tape=getattr(self.cli_args, "gdn_tape", False),
+                use_mlp_fuse=getattr(self.cli_args, "mlp_fuse", False),
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 mtp=getattr(self.cli_args, "mtp", False),
@@ -1027,6 +1066,23 @@ class ResponseGenerator:
                     break
 
                 if finish_reason is not None:
+                    prompt_tps = gen.prompt_tps
+                    gen_tps = gen.generation_tps
+                    n_gen = gen.generation_tokens
+                    n_prompt = gen.prompt_tokens
+                    msg = (
+                        f"prompt={n_prompt} tokens ({prompt_tps:.1f} t/s), "
+                        f"gen={n_gen} tokens ({gen_tps:.1f} t/s)"
+                    )
+                    if gen.draft_proposed > 0:
+                        rate = 100.0 * gen.draft_accepted / gen.draft_proposed
+                        msg += (
+                            f", draft={gen.draft_accepted}/{gen.draft_proposed}"
+                            f" ({rate:.1f}% accepted)"
+                        )
+                        if gen.draft_depth >= 0:
+                            msg += f", depth={gen.draft_depth}"
+                    logging.info(msg)
                     break
 
             rqueue.put(None)
@@ -1181,6 +1237,15 @@ class APIHandler(BaseHTTPRequestHandler):
         self.num_draft_tokens = self.body.get(
             "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
         )
+        self.min_draft_tokens = self.body.get(
+            "min_draft_tokens", getattr(self.response_generator.cli_args, "min_draft_tokens", -1)
+        )
+        self.max_draft_tokens = self.body.get(
+            "max_draft_tokens", getattr(self.response_generator.cli_args, "max_draft_tokens", -1)
+        )
+        self.draft_threshold = self.body.get(
+            "draft_threshold", getattr(self.response_generator.cli_args, "draft_threshold", -1.0)
+        )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
@@ -1251,6 +1316,9 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("top_k", int, min_val=0)
         self._validate("min_p", (float, int), min_val=0, max_val=1)
         self._validate("num_draft_tokens", int, min_val=0)
+        self._validate("min_draft_tokens", int, min_val=-1)
+        self._validate("max_draft_tokens", int, min_val=-1)
+        self._validate("draft_threshold", (float, int), min_val=0, max_val=1, whitelist=[-1])
         self._validate("repetition_penalty", (float, int), min_val=0)
         self._validate("repetition_context_size", int, min_val=0)
         self._validate("presence_penalty", (float, int))
@@ -1415,6 +1483,9 @@ class APIHandler(BaseHTTPRequestHandler):
             stop_words=stop_words,
             max_tokens=self.max_tokens,
             num_draft_tokens=self.num_draft_tokens,
+            min_draft_tokens=self.min_draft_tokens,
+            max_draft_tokens=self.max_draft_tokens,
+            draft_threshold=self.draft_threshold,
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
             seed=self.seed,
@@ -1906,7 +1977,113 @@ def main():
         help="Use native Multi-Token Prediction for speculative decoding "
         "(requires a model with an MTP head, e.g. Qwen3.5).",
     )
+    parser.add_argument(
+        "--min-draft-tokens",
+        type=int,
+        default=-1,
+        help="Minimum draft depth for adaptive MTP (-1 = disabled, use --num-draft-tokens).",
+    )
+    parser.add_argument(
+        "--max-draft-tokens",
+        type=int,
+        default=-1,
+        help="Maximum draft depth for adaptive MTP (-1 = disabled, use --num-draft-tokens).",
+    )
+    parser.add_argument(
+        "--draft-threshold",
+        type=float,
+        default=-1.0,
+        help=(
+            "Acceptance rate below which adaptive MTP reduces draft depth. "
+            "Default -1.0 = auto: use N/(N+1) per depth (break-even threshold). "
+            "Set a fixed value (e.g. 0.6) to override."
+        ),
+    )
+    parser.add_argument(
+        "--draft-head-bits",
+        type=int,
+        default=-1,
+        help=(
+            "Requantize the MTP draft lm_head to this precision at load time "
+            "(e.g. 4). Reduces draft-proposal latency at a potential small cost "
+            "in acceptance rate. Default -1 (disabled; uses the model's original "
+            "precision)."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-fc-bits",
+        type=int,
+        default=-1,
+        help=(
+            "Quantize unquantized linear layers inside the MTP module (e.g. the "
+            "fc fusion layer in Qwen3.5/3.6 sidecars) to this precision at load "
+            "time. Corrects sidecar models that bypassed the quantization pipeline. "
+            "Default -1 (disabled, model loaded as-is)."
+        ),
+    )
+    parser.add_argument(
+        "--gdn-tape",
+        action="store_true",
+        help=(
+            "Enable GDN tape capture during verify passes.  At partial acceptance "
+            "(0 < k < N), replays the delta tape to set the exact SSM state at "
+            "position k+1 instead of the approximate verify-all state.  Adds a "
+            "lightweight tape write during verify and a fast replay after partial "
+            "acceptance.  Only active when --mtp is also set."
+        ),
+    )
+    parser.add_argument(
+        "--mlp-fuse",
+        action="store_true",
+        help=(
+            "Enable fused MLP kernels (gate+up in one dispatch, swiglu+down in "
+            "another) for Qwen3Next models during MTP verify steps.  Reduces Metal "
+            "command encoder overhead and halves x-bandwidth for the two input "
+            "projections.  Requires q4/affine weights, N%%8==0, K%%512==0."
+        ),
+    )
+    parser.add_argument(
+        "--draft-head-schedule",
+        type=lambda s: [
+            None if v.strip().lower() in ("full", "f", "native", "none")
+            else int(v.strip())
+            for v in reversed(s.split(","))
+        ],
+        default=None,
+        metavar="SCHEDULE",
+        help=(
+            "Per-position lm_head precision schedule, left=first position, right=last. "
+            "Entries are bit widths (4, 8, ...) or 'native'/'full'. "
+            "Example: 'native,4' (last=4-bit, rest=native). "
+            "Overrides --draft-head-bits when both are set."
+        ),
+    )
+    parser.add_argument(
+        "--draft-head-policy",
+        type=str,
+        default="fixed",
+        metavar="POLICY",
+        help=(
+            "'fixed' (default): always use scheduled bits. "
+            "'adaptive' or 'adaptive:T': use scheduled bits per position only when "
+            "sliding-window acceptance rate >= T (default T=0.8)."
+        ),
+    )
+    parser.add_argument(
+        "--draft-algorithm",
+        type=str,
+        default="greedy",
+        metavar="ALGO",
+        help=(
+            "'greedy' (default): N/(N+1) threshold for depth. "
+            "'optimal': real-time measured backbone/MTP timing for true throughput-maximising depth. "
+            "'optimal:probe[:K]': also measures per-position delta-alpha every K rounds."
+        ),
+    )
     args = parser.parse_args()
+    policy = getattr(args, "draft_head_policy", "fixed").lower()
+    if not (policy == "fixed" or policy.startswith("adaptive")):
+        parser.error(f"--draft-head-policy must be 'fixed' or 'adaptive[:T]', got {policy!r}")
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)

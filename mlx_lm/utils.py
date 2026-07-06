@@ -6,6 +6,7 @@ import importlib
 import inspect
 import json
 import os
+import re
 import resource
 import shutil
 from pathlib import Path
@@ -194,6 +195,120 @@ def _get_classes(config: dict):
     return arch.Model, arch.ModelArgs
 
 
+def _maybe_build_mtp_draft_lm_heads(
+    model: nn.Module,
+    schedule: Optional[List[Optional[int]]],
+) -> None:
+    if not schedule:
+        return
+    lm = getattr(model, "language_model", model)
+    if not hasattr(lm, "mtp"):
+        return
+    head = getattr(lm, "lm_head", None)
+    if head is None:
+        return
+
+    native_bits = getattr(head, "bits", None)
+    existing = dict(getattr(lm, "_mtp_draft_lm_heads", {}))
+    bits_to_build = {b for b in schedule if b is not None and b != native_bits and b >= 2 and b not in existing}
+    if not bits_to_build:
+        return
+
+    group_size = getattr(head, "group_size", 64)
+    if isinstance(head, nn.QuantizedLinear):
+        pack_factor = 32 // head.bits
+        out_dims = head.weight.shape[0]
+        in_dims = head.weight.shape[1] * pack_factor
+        w_fp = mx.dequantize(
+            head.weight, head.scales, head.biases,
+            head.group_size, head.bits,
+            getattr(head, "mode", "affine"),
+        )
+    else:
+        out_dims, in_dims = head.weight.shape
+        w_fp = head.weight
+
+    heads_dict = {}
+    for bits in sorted(bits_to_build):
+        w_q, s_q, b_q = mx.quantize(w_fp, group_size=group_size, bits=bits)
+        mx.eval(w_q, s_q, b_q)
+        draft = nn.QuantizedLinear(in_dims, out_dims, bias=False, group_size=group_size, bits=bits)
+        draft.weight = w_q
+        draft.scales = s_q
+        draft.biases = b_q
+        heads_dict[bits] = draft
+
+    del w_fp
+    existing.update(heads_dict)
+    object.__setattr__(lm, "_mtp_draft_lm_heads", existing)
+
+
+def _load_saved_draft_lm_heads(model: nn.Module, model_path: Path) -> None:
+    lm = getattr(model, "language_model", model)
+    if not hasattr(lm, "mtp") or not hasattr(lm, "lm_head"):
+        return
+
+    heads_dict = dict(getattr(lm, "_mtp_draft_lm_heads", {}))
+    loaded_any = False
+
+    for sidecar in sorted(model_path.glob("draft_heads_*bit.safetensors")):
+        m = re.match(r"draft_heads_(\d+)bit\.safetensors$", sidecar.name)
+        if not m:
+            continue
+        bits = int(m.group(1))
+        if bits in heads_dict:
+            continue
+        arrays = mx.load(str(sidecar))
+        w, s, b = arrays["weight"], arrays["scales"], arrays["biases"]
+        pack_factor = 32 // bits
+        in_dims = w.shape[1] * pack_factor
+        out_dims = w.shape[0]
+        group_size = in_dims // s.shape[1]
+        draft = nn.QuantizedLinear(in_dims, out_dims, bias=False, group_size=group_size, bits=bits)
+        draft.weight = w
+        draft.scales = s
+        draft.biases = b
+        heads_dict[bits] = draft
+        loaded_any = True
+
+    if loaded_any:
+        object.__setattr__(lm, "_mtp_draft_lm_heads", heads_dict)
+
+
+def _maybe_build_mtp_draft_lm_head(model: nn.Module, bits: int = -1) -> None:
+    _maybe_build_mtp_draft_lm_heads(model, [bits] if bits >= 2 else None)
+
+
+def _maybe_quantize_mtp_fc(model: nn.Module, config: dict, bits: int = -1) -> None:
+    lm = getattr(model, "language_model", model)
+    if not hasattr(lm, "mtp"):
+        return
+    if bits < 2:
+        return
+    quant_cfg = config.get("quantization") or config.get("quantization_config")
+    group_size = quant_cfg.get("group_size", 64) if quant_cfg else 64
+
+    has_unquantized = any(
+        isinstance(m, nn.Linear) and not isinstance(m, nn.QuantizedLinear)
+        for _, m in lm.mtp.named_modules()
+        if hasattr(m, "weight") and m.weight.ndim == 2
+    )
+    if not has_unquantized:
+        return
+
+    nn.quantize(
+        lm.mtp,
+        group_size=group_size,
+        bits=bits,
+        class_predicate=lambda _p, m: (
+            isinstance(m, nn.Linear)
+            and not isinstance(m, nn.QuantizedLinear)
+            and hasattr(m, "weight")
+            and m.weight.ndim == 2
+        ),
+    )
+
+
 def get_total_parameters(model):
     leaf_modules = tree_flatten(
         model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
@@ -328,6 +443,11 @@ def load_model(
     weights = {}
     for wf in weight_files:
         weights.update(mx.load(wf))
+
+    if sidecar := config.get("mtp_file"):
+        sidecar_path = model_path / sidecar
+        if sidecar_path.exists():
+            weights.update(mx.load(str(sidecar_path)))
 
     if (model_file := config.get("model_file")) is not None:
         if not trust_remote_code:
@@ -473,6 +593,9 @@ def load(
     return_config: bool = False,
     revision: Optional[str] = None,
     trust_remote_code: bool = False,
+    draft_head_bits: int = -1,
+    draft_head_schedule: Optional[List[Optional[int]]] = None,
+    mtp_fc_bits: int = -1,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
@@ -496,6 +619,17 @@ def load(
         trust_remote_code (bool): If ``True``, allow loading models that require
             executing a custom Python file specified in their config.
             Default: ``False``.
+        draft_head_bits (int): Shorthand for ``draft_head_schedule=[bits]`` — all positions
+            use the same precision.  Ignored when ``draft_head_schedule`` is provided.
+            Default -1 (disabled).
+        draft_head_schedule: Back-indexed per-position precision schedule.
+            ``schedule[0]`` = bits for the last draft position, ``schedule[1]`` = second-to-last,
+            etc.  None entries use the native lm_head.  Heads are built for every unique
+            non-None bits value that differs from the model's native lm_head precision.
+            Default None (no draft heads built, native lm_head used everywhere).
+        mtp_fc_bits (int): When ≥ 2, quantize unquantized linear layers inside the
+            MTP module (e.g. the ``fc`` fusion layer in Qwen3.5/3.6 sidecars) to
+            this precision.  Default -1 (disabled, model loaded as-is).
     Returns:
         Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
             A tuple containing the loaded model, tokenizer and, if requested, the model config.
@@ -506,12 +640,14 @@ def load(
     """
     model_path = _download(path_or_hf_repo, revision=revision)
 
-    model, config = load_model(
-        model_path,
-        lazy,
-        model_config=model_config,
-        trust_remote_code=trust_remote_code,
-    )
+    effective_schedule = draft_head_schedule
+    if effective_schedule is None and draft_head_bits >= 2:
+        effective_schedule = [draft_head_bits]
+
+    model, config = load_model(model_path, lazy, model_config=model_config, trust_remote_code=trust_remote_code)
+    _maybe_quantize_mtp_fc(model, config, bits=mtp_fc_bits)
+    _load_saved_draft_lm_heads(model, model_path)
+    _maybe_build_mtp_draft_lm_heads(model, effective_schedule)
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
