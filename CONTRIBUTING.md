@@ -1,3 +1,5 @@
+# BEWARE BEFORE CONTRIBUTING
+
 Contributions are tolerated but not welcome.
 
 You are free to contribute to add support for your own favorite models but changes to the code logic that affect other models actively being developed by the developer (mostly Qwen family) will likely be rejected.
